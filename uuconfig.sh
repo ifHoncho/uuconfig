@@ -11,7 +11,7 @@
 #
 set -uo pipefail
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 PROG="${0##*/}"
 SELF="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
 
@@ -21,6 +21,15 @@ CONF_20="/etc/apt/apt.conf.d/20auto-upgrades"
 TIMER_DIR="/etc/systemd/system/apt-daily-upgrade.timer.d"
 TIMER_OVERRIDE="${TIMER_DIR}/override.conf"
 STAMP="$(date +%Y%m%d-%H%M%S)"
+
+# Backups deliberately live outside the directories they came from.  apt reads
+# every file in /etc/apt/apt.conf.d/ and prints
+#   N: Ignoring file '…' as it has an invalid filename extension
+# on each `apt-get update` for any name it doesn't recognise, so a backup left
+# beside the original is permanent noise.  Each run gets its own snapshot
+# directory mirroring the original absolute paths.
+BACKUP_DIR="/var/backups/uuconfig"
+BACKUP_RUN="${BACKUP_DIR}/${STAMP}"
 
 # ----------------------------------------------------------------- colours ---
 if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
@@ -63,6 +72,8 @@ EXCLUDES=""
 
 DRY_RUN="false"
 ANY_FLAG="false"
+TIDY_ONLY="false"          # -B: only clean up stray backup files, then exit
+TIDIED=0                   # how many stray backups the last tidy run handled
 
 # ------------------------------------------------- package-index / picker ---
 PKG_DB=""                  # temp file: "normalized<TAB>name" table (built once)
@@ -131,6 +142,9 @@ ${BOLD}POWER${RST}
 
 ${BOLD}CONTROL${RST}
   -n            Dry run — show exactly what would change, modify nothing
+  -B            Move backup files left in apt's config directory by older
+                versions into /var/backups/uuconfig/, then exit
+                ${DIM}(they make apt warn on every update; combine with -n to preview)${RST}
   -h            Show this help and exit
   -V            Show version and exit
 
@@ -687,11 +701,39 @@ print_summary() {
 
 # ---------------------------------------------------------------- apply ---
 backup_if_exists() {
-  local f="$1"
-  if [[ -e "$f" ]]; then
-    cp -a "$f" "${f}.autoupdate.bak-${STAMP}" \
-      && ok "Backed up $(basename "$f") → ${f}.autoupdate.bak-${STAMP}"
-  fi
+  local f="$1" dest="${BACKUP_RUN}${1}"
+  [[ -e "$f" ]] || return 0
+  mkdir -p "${dest%/*}" || { warn "Could not create ${dest%/*} — $f was not backed up."; return 1; }
+  cp -a "$f" "$dest" \
+    && ok "Backed up $(basename "$f") → $dest" \
+    || warn "Could not back up $f."
+}
+
+# Versions before 1.1.0 wrote backups next to the originals, as
+# "<name>.autoupdate.bak-<timestamp>".  apt cannot parse those names and warns
+# about them on every run, so move any left behind into $BACKUP_DIR/legacy/.
+tidy_legacy_backups() {
+  local f dest moved=0
+  for f in "${CONF_50%/*}"/*.autoupdate.bak-* "$TIMER_DIR"/*.autoupdate.bak-*; do
+    [[ -e "$f" ]] || continue          # unmatched glob stays literal
+    dest="${BACKUP_DIR}/legacy${f}"
+    if [[ "$DRY_RUN" == "true" ]]; then
+      info "  Would move $f → $dest"
+      moved=$((moved + 1))
+      continue
+    fi
+    mkdir -p "${dest%/*}" || { warn "Could not create ${dest%/*} — left $f in place."; continue; }
+    if mv -f "$f" "$dest"; then
+      moved=$((moved + 1))
+      ok "Moved old backup $(basename "$f") → $dest"
+    else
+      warn "Could not move $f — apt will keep warning about it."
+    fi
+  done
+  TIDIED="$moved"
+  (( moved )) && [[ "$DRY_RUN" != "true" ]] && \
+    info "  ${DIM}apt will stop warning about those on the next update.${RST}"
+  return 0
 }
 
 install_uu() {
@@ -742,6 +784,7 @@ apply_all() {
   hr
   step "Applying configuration…"
   install_uu
+  tidy_legacy_backups
   backup_if_exists "$CONF_20"
   backup_if_exists "$CONF_50"
   backup_if_exists "$TIMER_OVERRIDE"
@@ -757,6 +800,8 @@ apply_all() {
   info "  • Test a run now (changes nothing):  ${DIM}sudo unattended-upgrade --dry-run --debug${RST}"
   info "  • See the next scheduled run:        ${DIM}systemctl list-timers apt-daily-upgrade.timer${RST}"
   info "  • Read the last run's log:           ${DIM}less /var/log/unattended-upgrades/unattended-upgrades.log${RST}"
+  [[ -d "$BACKUP_RUN" ]] && \
+    info "  • Restore the previous config from:  ${DIM}${BACKUP_RUN}${RST}"
   [[ "$MAIL_ENABLED" == "true" ]] \
     && info "  • Email reports need a working mail transport (e.g. postfix or msmtp)."
 }
@@ -841,7 +886,7 @@ run_interactive() {
 # ---------------------------------------------------------------- main ---
 main() {
   local OPTIND opt
-  while getopts ":hVsarR:ut:m:M:x:pkdcn" opt; do
+  while getopts ":hVsarR:ut:m:M:x:pkdcnB" opt; do
     ANY_FLAG="true"
     case "$opt" in
       h) usage; exit 0 ;;
@@ -860,6 +905,7 @@ main() {
       d) RM_DEPS="true" ;;
       c) AUTOCLEAN="true" ;;
       n) DRY_RUN="true" ;;
+      B) TIDY_ONLY="true" ;;
       :)  die "Option -$OPTARG requires an argument. See '$PROG -h'." ;;
       \?) die "Unknown option -$OPTARG. See '$PROG -h'." ;;
     esac
@@ -880,6 +926,16 @@ main() {
 
   # If packages were excluded via -x, flag any that apt doesn't recognise.
   [[ "$ANY_FLAG" == "true" ]] && warn_unknown_excludes
+
+  # -B is housekeeping only: tidy stray backups and leave the config alone.
+  if [[ "$TIDY_ONLY" == "true" ]]; then
+    banner
+    [[ "$DRY_RUN" == "true" ]] || ensure_root "$@"
+    step "Looking for backup files left in apt's configuration directories…"
+    tidy_legacy_backups
+    (( TIDIED )) || ok "None found — nothing to clean up."
+    exit 0
+  fi
 
   # Dry run needs no privileges and never writes anything.
   if [[ "$DRY_RUN" == "true" ]]; then

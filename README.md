@@ -21,7 +21,7 @@ sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/ifHoncho/uuconfig/m
 - **Non-interactive "express" mode** — bundle short flags for one-line, script-friendly setup: `uuconfig.sh -srkdc`.
 - **Dry-run preview** — see exactly what would be written, with no root privileges required and nothing touched: `uuconfig.sh -n ...`.
 - **Distro-aware** — automatically detects Ubuntu vs. Debian and writes the correct upgrade-origins syntax for each.
-- **Safe by default** — backs up any existing config before replacing it, and validates the result with `apt-config dump` after applying.
+- **Safe by default** — backs up any existing config to `/var/backups/uuconfig/` before replacing it, and validates the result with `apt-config dump` after applying.
 
 ## Requirements
 
@@ -64,6 +64,7 @@ chmod +x uuconfig.sh
 | `-M WHEN` | When to mail: `on-change` \| `only-on-error` \| `always` *(default `on-change`)* |
 | `-p` | Only run while on AC power (recommended for laptops) |
 | `-n` | Dry run — show exactly what would change, modify nothing |
+| `-B` | Move backups left in apt's config directory by versions before 1.1.0 into `/var/backups/uuconfig/`, then exit (combine with `-n` to preview) |
 | `-h` | Show help and exit |
 | `-V` | Show version and exit |
 
@@ -85,6 +86,12 @@ Flags can be bundled — `uuconfig.sh -srkdc` means security-only updates, auto-
 - `/etc/systemd/system/apt-daily-upgrade.timer.d/override.conf` — sets the daily run time
 
 Applying only writes configuration and enables the relevant systemd timers — it does not trigger an immediate upgrade or reboot.
+
+## Backups
+
+Any file that gets replaced is copied first into a per-run snapshot under `/var/backups/uuconfig/<timestamp>/`, mirroring its original path — e.g. `/var/backups/uuconfig/20260729-101839/etc/apt/apt.conf.d/50unattended-upgrades`. To roll back, copy the file straight back over the original.
+
+Backups are kept there rather than beside the originals on purpose: apt reads *every* file in `/etc/apt/apt.conf.d/` and prints `N: Ignoring file '…' as it has an invalid filename extension` on each `apt-get update` for any name it doesn't recognise, so a timestamped backup left in that directory produces a warning forever. Versions before 1.1.0 did leave backups there; run `sudo ./uuconfig.sh -B` once to move them out and silence the warnings.
 
 ## Notes
 
